@@ -57,4 +57,4 @@ jobs:
           app-name: 'MyFirstAppSibo2026'
           slot-name: 'Production'
           package: .
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_2B773EB064CE4EBBBCC09AEC474DEAAA }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_821D687747F94716986983A01447D709 }}
