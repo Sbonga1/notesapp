@@ -11,99 +11,110 @@ function h($value) {
     return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
 }
 
-// Get a Microsoft Entra token using Azure App Service Managed Identity.
-function get_mysql_token() {
-    $endpoint = envv('IDENTITY_ENDPOINT');
-    $header = envv('IDENTITY_HEADER');
+// Read a value from the Azure SQL connection string.
+function connection_value($connectionString, $key, $default = '') {
+    $parts = explode(';', $connectionString);
 
-    // Local fallback for testing only.
-    if ($endpoint === '' || $header === '') {
-        return envv('DB_TOKEN');
+    foreach ($parts as $part) {
+        if (strpos($part, '=') === false) {
+            continue;
+        }
+
+        [$name, $value] = array_map('trim', explode('=', $part, 2));
+
+        if (strtolower($name) === strtolower($key)) {
+            return $value;
+        }
     }
 
-    // Azure MySQL Entra authentication resource.
-    $resource = urlencode('https://ossrdbms-aad.database.windows.net');
-    $clientId = envv('AZURE_CLIENT_ID');
-
-    $url = $endpoint . '?api-version=2019-08-01&resource=' . $resource;
-
-    // Use user-assigned managed identity if provided.
-    if ($clientId !== '') {
-        $url .= '&client_id=' . urlencode($clientId);
-    }
-
-    // Request the token from Azure.
-    $ch = curl_init($url);
-
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => [
-            'X-IDENTITY-HEADER: ' . $header
-        ]
-    ]);
-
-    $response = curl_exec($ch);
-
-    if ($response === false) {
-        throw new Exception('Could not get Managed Identity token.');
-    }
-
-    $data = json_decode($response, true);
-
-    if (!isset($data['access_token'])) {
-        throw new Exception('Managed Identity token was not returned.');
-    }
-
-    return $data['access_token'];
+    return $default;
 }
 
-// Database settings from Azure App Service.
-$dbHost = envv('DB_HOST');
-$dbPort = (int) envv('DB_PORT', '3306');
-$dbName = envv('DB_NAME', 'notes_php_app');
-$dbUser = envv('DB_USER');
-$dbPass = get_mysql_token();
+// Convert SQL Server errors into readable text.
+function sql_errors_text() {
+    $errors = sqlsrv_errors();
 
-// Make MySQL errors easier to catch.
-mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+    if ($errors === null) {
+        return 'No SQL Server error details were returned.';
+    }
+
+    $messages = [];
+
+    foreach ($errors as $error) {
+        $messages[] = 'SQLSTATE: ' . $error['SQLSTATE'] .
+            ' | Code: ' . $error['code'] .
+            ' | Message: ' . $error['message'];
+    }
+
+    return implode("\n", $messages);
+}
+
+// Make sure the SQL Server PHP driver is available.
+if (!function_exists('sqlsrv_connect')) {
+    http_response_code(500);
+    echo "<h1>SQL Server PHP driver missing</h1>";
+    echo "<p>The app needs the sqlsrv PHP extension to connect to Azure SQL Database.</p>";
+    exit;
+}
+
+// Azure App Service stores SQLAzure connection strings using this name format.
+$connectionString = envv('SQLAZURECONNSTR_DefaultConnection');
+
+// Read server and database from the Azure connection string.
+$sqlServer = connection_value($connectionString, 'Server');
+$sqlDatabase = connection_value($connectionString, 'Database');
+
+// Some Azure connection strings use Initial Catalog instead of Database.
+if ($sqlDatabase === '') {
+    $sqlDatabase = connection_value($connectionString, 'Initial Catalog');
+}
+
+// Fallback values if you decide to use normal App Settings instead.
+$sqlServer = envv('SQLSERVER_HOST', $sqlServer);
+$sqlDatabase = envv('SQLSERVER_DB', $sqlDatabase);
+
+// Remove tcp: if Azure added it to the server name.
+$sqlServer = str_replace('tcp:', '', $sqlServer);
 
 try {
-    // 1) Allow the access token to be sent to MySQL.
-    putenv('LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN=1');
+    // 1) Connect to Azure SQL Database using Managed Identity.
+    // Do not use username or password with Microsoft Entra-only authentication.
+    $connectionOptions = [
+        'Database' => $sqlDatabase,
+        'Authentication' => 'ActiveDirectoryMsi',
+        'Encrypt' => true,
+        'TrustServerCertificate' => false,
+        'CharacterSet' => 'UTF-8'
+    ];
 
-    // 2) Connect to Azure MySQL using Managed Identity.
-    $conn = mysqli_init();
+    $conn = sqlsrv_connect($sqlServer, $connectionOptions);
 
-    // Required for Azure MySQL SSL connection.
-    mysqli_ssl_set($conn, null, null, null, null, null);
+    if ($conn === false) {
+        throw new Exception(sql_errors_text());
+    }
 
-    mysqli_real_connect(
-        $conn,
-        $dbHost,
-        $dbUser,
-        $dbPass,
-        $dbName,
-        $dbPort,
-        null,
-        MYSQLI_CLIENT_SSL
-    );
+    // 2) Create the table if it does not exist.
+    $createTableSql = "
+        IF OBJECT_ID('dbo.notes', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.notes (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                title NVARCHAR(120) NOT NULL,
+                body NVARCHAR(MAX) NOT NULL,
+                created_at DATETIME2 NOT NULL DEFAULT SYSDATETIME()
+            );
+        END
+    ";
 
-    // 3) Set the character encoding.
-    $conn->set_charset('utf8mb4');
+    $stmt = sqlsrv_query($conn, $createTableSql);
 
-    // 4) Create the table if it does not exist.
-    $conn->query("
-        CREATE TABLE IF NOT EXISTS notes (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            title VARCHAR(120) NOT NULL,
-            body TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-    ");
+    if ($stmt === false) {
+        throw new Exception(sql_errors_text());
+    }
 
     $notice = '';
 
-    // 5) Handle form actions.
+    // 3) Handle form actions.
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $action = $_POST['action'] ?? '';
 
@@ -113,9 +124,16 @@ try {
             $body = trim($_POST['body'] ?? '');
 
             if ($title !== '' && $body !== '') {
-                $stmt = $conn->prepare("INSERT INTO notes (title, body) VALUES (?, ?)");
-                $stmt->bind_param("ss", $title, $body);
-                $stmt->execute();
+                $stmt = sqlsrv_query(
+                    $conn,
+                    "INSERT INTO dbo.notes (title, body) VALUES (?, ?)",
+                    [$title, $body]
+                );
+
+                if ($stmt === false) {
+                    throw new Exception(sql_errors_text());
+                }
+
                 $notice = 'Note added successfully.';
             }
         }
@@ -127,9 +145,16 @@ try {
             $body = trim($_POST['body'] ?? '');
 
             if ($id > 0 && $title !== '' && $body !== '') {
-                $stmt = $conn->prepare("UPDATE notes SET title = ?, body = ? WHERE id = ?");
-                $stmt->bind_param("ssi", $title, $body, $id);
-                $stmt->execute();
+                $stmt = sqlsrv_query(
+                    $conn,
+                    "UPDATE dbo.notes SET title = ?, body = ? WHERE id = ?",
+                    [$title, $body, $id]
+                );
+
+                if ($stmt === false) {
+                    throw new Exception(sql_errors_text());
+                }
+
                 $notice = 'Note updated successfully.';
             }
         }
@@ -139,26 +164,47 @@ try {
             $id = (int)($_POST['id'] ?? 0);
 
             if ($id > 0) {
-                $stmt = $conn->prepare("DELETE FROM notes WHERE id = ?");
-                $stmt->bind_param("i", $id);
-                $stmt->execute();
+                $stmt = sqlsrv_query(
+                    $conn,
+                    "DELETE FROM dbo.notes WHERE id = ?",
+                    [$id]
+                );
+
+                if ($stmt === false) {
+                    throw new Exception(sql_errors_text());
+                }
+
                 $notice = 'Note deleted successfully.';
             }
         }
     }
 
-    // 6) Load notes.
-    $result = $conn->query("SELECT id, title, body, created_at FROM notes ORDER BY id DESC");
-    $notes = $result->fetch_all(MYSQLI_ASSOC);
+    // 4) Load notes.
+    $stmt = sqlsrv_query(
+        $conn,
+        "SELECT id, title, body, CONVERT(VARCHAR(19), created_at, 120) AS created_at
+         FROM dbo.notes
+         ORDER BY id DESC"
+    );
 
-    // 7) Check if the user is editing a note.
+    if ($stmt === false) {
+        throw new Exception(sql_errors_text());
+    }
+
+    $notes = [];
+
+    while ($row = sqlsrv_fetch_array($stmt, SQLSRV_FETCH_ASSOC)) {
+        $notes[] = $row;
+    }
+
+    // 5) Check if the user is editing a note.
     $editId = isset($_GET['edit']) ? (int)$_GET['edit'] : 0;
 
 } catch (Throwable $e) {
     // Show a simple error during deployment testing.
     http_response_code(500);
     echo "<h1>Database connection failed</h1>";
-    echo "<p>Check Managed Identity, DB_USER, MySQL Entra user, and firewall/network settings.</p>";
+    echo "<p>Check Managed Identity, SQLAzure connection string, database user permissions, and firewall settings.</p>";
     echo "<pre>" . h($e->getMessage()) . "</pre>";
     exit;
 }
